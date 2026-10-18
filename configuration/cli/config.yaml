@@ -1,0 +1,5 @@
+server: http://127.0.0.1:8080
+request_timeout: 20s
+client_id: ""
+token: ""
+token_file: .CLI_TOKEN

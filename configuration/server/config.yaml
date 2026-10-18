@@ -1,0 +1,8 @@
+addr: 127.0.0.1:8080
+database_url: postgres://times:times@127.0.0.1:54329/times?sslmode=disable
+threshold: 1.1
+half_life: 6h
+congratulate: 3
+cache_refresh: 5m
+session_ttl: 24h
+clients: []

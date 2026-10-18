@@ -1,0 +1,22 @@
+# Скопируйте в .times-local/server.local.yaml. Запускайте из корня проекта.
+addr: 127.0.0.1:8080
+database_url: postgres://times:times@127.0.0.1:54329/times?sslmode=disable
+threshold: 1.1
+half_life: 6h
+congratulate: 3
+cache_refresh: 5m
+session_ttl: 24h
+
+# Чтобы включить HTTPS, задайте оба пути и поменяйте server в конфиге клиента.
+tls_cert_file: ""
+tls_key_file: ""
+
+clients:
+  # Впишите своё имя. Оно должно совпадать с client_id в конфиге клиента.
+  - name: editor
+    kind: staff
+    role: editor
+    trust: 1
+    enabled: true
+    # Этот файл создаст сервер при выдаче токена. Сам токен сюда не вписывайте.
+    token_file: .times-local/editor.token

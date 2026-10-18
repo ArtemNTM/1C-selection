@@ -1,0 +1,1062 @@
+openapi: 3.0.3
+info:
+  title: Издание — HTTP API
+  version: 1.0.0
+  description: |
+    Сервер принимает заметки сотрудников, объединяет их по точной паре
+    «рубрика + тема» и публикует сюжет при достижении порога доверия.
+
+    **Как попробовать взаимодействие:**
+
+    1. Создайте первого редактора через список `clients` в YAML сервера и запустите сервер.
+    2. Выполните `POST /hello` без Authorize, передав имя редактора в `client_id`
+       и его персональный `token`.
+    3. Нажмите **Authorize** и вставьте `session_token` из ответа без слова `Bearer`.
+    4. Через `POST /clients` создайте корреспондентов. Сохраните выданные токены:
+       они возвращаются только при создании и затем используются многократно.
+    5. Для работы от имени корреспондента выполните `POST /hello` с его именем
+       и персональным токеном. Откройте Authorize и замените токен на выданный `session_token`.
+       Отправьте заметку через `POST /notes`, затем посмотрите сюжет и свою статистику.
+    6. После переподключения получите `GET /notifications` и подтвердите каждое
+       обработанное уведомление через `POST /notifications/{id}/ack`.
+
+    Рукопожатие создаёт сессию в PostgreSQL и возвращает `client`, `session_token`
+    и `expires_at`. Authorize заполняется вручную. Персональный токен подходит
+    только для рукопожатия; защищённые запросы принимают только токен сессии.
+    После истечения срока повторите `/hello` и вручную обновите Authorize.
+    Каждый защищённый запрос проверяет срок сессии, актуальную роль и `enabled`
+    по PostgreSQL. Клиентский `client_id` в рукопожатии — строковое имя;
+    числовые ID в остальных ответах и путях — ID БД.
+
+    Срок сессии по умолчанию `24h`, настраивается через серверный `session_ttl`
+    или `--session-ttl`. Истёкшие записи удаляются раз в `cache_refresh`;
+    проверка срока при запросе не зависит от этой очистки.
+
+    Запросы Execute выполняются на том же сервере, где открыта документация.
+    Примеры ID и времени иллюстративные: используйте ID из реальных ответов,
+    а для новой заметки задавайте новый `request_id` и актуальный `event_at`.
+    Для повторной доставки передавайте прежний `request_id` и неизменные поля.
+
+    Тела запросов — JSON размером до 65536 байт. Неизвестные поля и лишние
+    JSON-значения отклоняются. Все даты передаются в RFC3339 с часовым поясом.
+    Подробности ошибок PostgreSQL возвращаются только в серверный лог.
+servers:
+  - url: /
+    description: Сервер, с которого открыта документация
+security:
+  - SessionToken: []
+tags:
+  - name: Состояние
+    description: Проверка доступности HTTP-сервера.
+  - name: Подключение
+    description: Проверка имени и персонального токена клиента, выдача сессии.
+  - name: Клиенты
+    description: Управление сотрудниками. Требуется роль editor.
+  - name: Заметки
+    description: Приём заметок, защита от повторной записи и публикация сюжетов.
+  - name: Сюжеты
+    description: Опубликованные и неопубликованные сюжеты, доверие и участники.
+  - name: Уведомления
+    description: Получение своих поздравлений и подтверждение доставки.
+  - name: Статистика
+    description: Собственная статистика и редакторский просмотр всех сотрудников.
+paths:
+  /healthz:
+    get:
+      operationId: health
+      tags: [Состояние]
+      summary: Проверить доступность HTTP-сервера
+      description: Возвращает фиксированный ответ. Подключение к PostgreSQL не проверяет.
+      security: []
+      responses:
+        '200':
+          description: HTTP-сервер отвечает.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+              example:
+                status: ok
+  /hello:
+    post:
+      operationId: hello
+      tags: [Подключение]
+      summary: Выполнить рукопожатие
+      description: |
+        Проверяет имя, SHA-256-хеш персонального токена и `enabled`, создаёт
+        сессию в PostgreSQL. Возвращает публичные данные сотрудника, случайный
+        `session_token` и срок `expires_at`. В БД хранится только SHA-256-хеш
+        токена сессии длиной 32 байта, client_id, created_at и expires_at.
+        Для рабочих запросов скопируйте session_token в Authorize;
+        персональный токен в Bearer не принимается. После истечения срока
+        повторите рукопожатие и вручную замените значение в Authorize.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HelloRequest'
+            example:
+              client_id: editor
+              token: <вставьте персональный токен редактора>
+      responses:
+        '200':
+          description: Сессия создана. Персональный токен и хеши в ответ не включаются.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HelloResponse'
+              example:
+                client:
+                  id: 1
+                  name: editor
+                  kind: staff
+                  role: editor
+                  trust: 1
+                  enabled: true
+                  created_at: '2026-10-18T12:00:00Z'
+                session_token: <токен сессии из ответа рукопожатия>
+                expires_at: '2026-10-19T12:00:00Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /clients:
+    get:
+      operationId: listClients
+      tags: [Клиенты]
+      summary: Получить список сотрудников
+      description: |
+        Только editor. Возвращает всех сотрудников, включая отключённых,
+        по возрастанию числового ID. Токены и их хеши не возвращаются.
+        Данные читаются из полного кеша или PostgreSQL.
+      x-required-role: editor
+      responses:
+        '200':
+          description: Список сотрудников; при отсутствии записей — пустой массив.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Client'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: createClient
+      tags: [Клиенты]
+      summary: Создать сотрудника и выдать персональный токен
+      description: |
+        Только editor. Генерирует токен из 32 случайных байт и возвращает его
+        в Base64 URL без padding. В БД сохраняется только SHA-256-хеш.
+        Сохраните исходный токен из ответа: отдельной ручки его чтения нет.
+        Повторное создание того же имени возвращает 409.
+
+        `kind` определяет тип источника, `role` — права, `trust` — доверие.
+        Эти поля независимы. Если `trust` пропущен, HTTP API использует 0;
+        значения staff=1 и freelance=0.25 автоматически подставляет только CLI.
+        Если `enabled` пропущен или равен null, создаётся включённый клиент.
+      x-required-role: editor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateClientRequest'
+            examples:
+              freelance:
+                summary: Внештатный корреспондент Тонни
+                value:
+                  name: tonny
+                  kind: freelance
+                  role: reporter
+                  trust: 0.25
+                  enabled: true
+              staff:
+                summary: Штатный корреспондент Сахарисса
+                value:
+                  name: sacharissa
+                  kind: staff
+                  role: reporter
+                  trust: 1
+                  enabled: true
+      responses:
+        '201':
+          description: Сотрудник создан. Исходный токен выдаётся в этом ответе.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientCredentials'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /clients/{id}:
+    patch:
+      operationId: updateClient
+      tags: [Клиенты]
+      summary: Изменить доверие или доступ сотрудника
+      description: |
+        Только editor. Меняет `trust`, `enabled` или оба поля. Нужно хотя бы
+        одно поле, отличное от null: 0 и false считаются явно заданными значениями;
+        null или отсутствующее поле сохраняют прежнее значение.
+
+        Имя, тип, роль и токен этой ручкой не меняются. Изменение сбрасывает
+        кеш сотрудников и сюжетов. Отключение запрещает следующие обращения,
+        но не удаляет старые голоса и не обнуляет их доверие.
+        Новое доверие учитывается при следующем расчёте неопубликованного сюжета.
+        Сама смена доверия не запускает публикацию: она проверяется при принятии
+        следующей новой заметки. Исторические публикации сохраняются.
+      x-required-role: editor
+      parameters:
+        - $ref: '#/components/parameters/ClientID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateClientRequest'
+            examples:
+              trust:
+                summary: Изменить доверие
+                value:
+                  trust: 0.5
+              disable:
+                summary: Запретить вход
+                value:
+                  enabled: false
+              enable:
+                summary: Разрешить вход
+                value:
+                  enabled: true
+      responses:
+        '200':
+          description: Обновлённые публичные данные сотрудника.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Client'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /notes:
+    post:
+      operationId: submitNote
+      tags: [Заметки]
+      summary: Отправить заметку и получить квитанцию
+      description: |
+        Автор определяется по Bearer-токену сессии, выданному через /hello.
+        Персональный токен не принимается. Поля client_id в теле нет.
+        Сюжет выбирается по точной паре rubric/topic; регистр и пробелы не нормализуются.
+
+        Повтор того же запроса с тем же request_id от того же автора возвращает
+        status=duplicate без новой строки. Изменённые поля с прежним request_id
+        дают 409. Один request_id допустим у разных авторов.
+
+        Новая операция сохраняется со status=accepted. Голос даёт только первая
+        заметка автора до публикации сюжета. Следующие заметки того же автора
+        и заметки после публикации сохраняются с contributes=false.
+        Они не обновляют время или вес первого голоса.
+
+        Вес голоса: актуальное доверие автора × 2^(-возраст события / half_life).
+        По умолчанию half_life=6h, порог=1.1. При достижении порога в одной
+        транзакции фиксируются публикация, места всех участников и поздравления
+        первым congratulate авторам (по умолчанию 3). Место определяется порядком
+        принятых заметок, а event_at влияет на затухание.
+
+        Для новой заметки измените пример request_id и укажите актуальный event_at.
+        Для retry оставьте все поля прежними. Признак published показывает
+        состояние сюжета на момент ответа, включая повторную доставку.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NoteRequest'
+            example:
+              request_id: ea466278-d76e-45c7-bbb3-11f3658a6ee1
+              rubric: Город
+              topic: Обрушился мост
+              body: Увидел разрушенный мост
+              event_at: '2026-10-18T12:00:00Z'
+      responses:
+        '200':
+          description: Заметка принята или распознана как повторная доставка.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Receipt'
+              examples:
+                accepted:
+                  summary: Первый голос автора, сюжет ещё не опубликован
+                  value:
+                    status: accepted
+                    note_id: 100
+                    story_id: 10
+                    contributes: true
+                    published: false
+                duplicate:
+                  summary: Повторная доставка той же заметки
+                  value:
+                    status: duplicate
+                    note_id: 100
+                    story_id: 10
+                    contributes: true
+                    published: false
+                published:
+                  summary: Заметка Сахариссы достигла порога публикации
+                  value:
+                    status: accepted
+                    note_id: 102
+                    story_id: 10
+                    contributes: true
+                    published: true
+                additional:
+                  summary: Новая заметка автора, уже имеющего голос
+                  value:
+                    status: accepted
+                    note_id: 101
+                    story_id: 10
+                    contributes: false
+                    published: false
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /stories:
+    get:
+      operationId: listStories
+      tags: [Сюжеты]
+      summary: Получить список сюжетов
+      description: |
+        Доступно любому авторизованному клиенту. Возвращает опубликованные
+        и неопубликованные сюжеты по убыванию ID. Для неопубликованных считается
+        затухающее доверие; после публикации current_trust равен trust_at_publish.
+        Данные читаются из полного кеша или БД. Поле participants в списке
+        необязательно; гарантированное получение состава — GET /stories/{id}.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Список сюжетов; при отсутствии записей — пустой массив.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Story'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /stories/{id}:
+    get:
+      operationId: getStory
+      tags: [Сюжеты]
+      summary: Получить сюжет и его участников
+      description: |
+        Доступно любому авторизованному клиенту. Возвращает данные сюжета,
+        сумму доверия и первые голоса авторов по возрастанию first_note_id.
+        Дополнительные заметки и опоздавшие авторы в participants не включаются.
+        До публикации места равны null; после неё места и сумма публикации фиксированы.
+        Тексты заметок в ответ не входят. Пустой participants может быть опущен.
+      parameters:
+        - $ref: '#/components/parameters/StoryID'
+      responses:
+        '200':
+          description: Сюжет найден.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Story'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /notifications:
+    get:
+      operationId: listNotifications
+      tags: [Уведомления]
+      summary: Получить свои неподтверждённые поздравления
+      description: |
+        Получатель определяется по токену; editor тоже получает только свои
+        сообщения. Выбираются acknowledged_at=null по возрастанию ID.
+        Чтение не меняет состояние доставки. Сообщения сохраняются в PostgreSQL
+        и остаются доступны после переподключения или перезапуска сервера.
+        После успешной обработки подтвердите каждое через ручку ack.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Неподтверждённые сообщения; при отсутствии — пустой массив.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Notification'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /notifications/{id}/ack:
+    post:
+      operationId: acknowledgeNotification
+      tags: [Уведомления]
+      summary: Подтвердить получение своего уведомления
+      description: |
+        Устанавливает acknowledged_at. Тело не требуется. Подтверждённая строка
+        сохраняется, но исключается из GET /notifications. Повторный ack успешен
+        и не меняет первое время подтверждения. Чужой или неизвестный ID даёт 404.
+        Подтверждайте только после обработки: сбой до ack приведёт к повторной доставке.
+      parameters:
+        - $ref: '#/components/parameters/NotificationID'
+      responses:
+        '204':
+          description: Получение подтверждено. Тело ответа отсутствует.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /stats/me:
+    get:
+      operationId: myStats
+      tags: [Статистика]
+      summary: Получить свою статистику
+      description: |
+        Сотрудник определяется по токену. Считает агрегаты по его заметкам
+        и участие в сюжетах в согласованной транзакции PostgreSQL.
+        Повтор доставки с тем же request_id не увеличивает счётчики.
+        Новая заметка того же автора увеличивает notes_accepted, даже если
+        она не даёт голос. Статистика вычисляется при запросе и не кешируется.
+      responses:
+        '200':
+          description: Статистика текущего сотрудника.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Stats'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /stats:
+    get:
+      operationId: allStats
+      tags: [Статистика]
+      summary: Получить статистику всех сотрудников
+      description: |
+        Только editor. Возвращает статистику всех клиентов по возрастанию ID,
+        включая отключённых и сотрудников без заметок. Все данные читаются
+        в одной транзакции RepeatableRead. Результат не кешируется.
+      x-required-role: editor
+      responses:
+        '200':
+          description: Статистика сотрудников; при отсутствии — пустой массив.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Stats'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+components:
+  securitySchemes:
+    SessionToken:
+      type: http
+      scheme: bearer
+      description: |
+        Случайный session_token из ответа POST /hello. В Authorize вставьте
+        только его: Swagger UI добавит Authorization: Bearer автоматически.
+        Персональный токен здесь не подходит. Это не JWT. После expires_at
+        повторите /hello и вручную замените токен. Он не сохраняется UI между
+        перезагрузками страницы. По умолчанию срок сессии — 24 часа.
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      description: Максимальное количество записей в ответе. Пустое значение использует default.
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 100
+    ClientID:
+      name: id
+      in: path
+      description: Числовой ID сотрудника из ответа создания или списка клиентов.
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+        example: 2
+    StoryID:
+      name: id
+      in: path
+      description: Числовой ID сюжета из квитанции или списка сюжетов.
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+        example: 10
+    NotificationID:
+      name: id
+      in: path
+      description: ID уведомления из GET /notifications. Это не ID сюжета.
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+        example: 500
+  schemas:
+    Client:
+      type: object
+      additionalProperties: false
+      required: [id, name, kind, role, trust, enabled, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Числовой ID в PostgreSQL.
+          example: 2
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Уникальное имя; используется как client_id в рукопожатии.
+          example: tonny
+        kind:
+          type: string
+          enum: [staff, freelance]
+          description: Тип источника. Не определяет права доступа.
+          example: freelance
+        role:
+          type: string
+          enum: [reporter, editor]
+          description: Роль доступа. Не является местом автора в публикации.
+          example: reporter
+        trust:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: Актуальное доверие к сотруднику.
+          example: 0.25
+        enabled:
+          type: boolean
+          description: Разрешено ли сотруднику проходить аутентификацию.
+          example: true
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-10-18T12:00:00Z'
+    HelloRequest:
+      type: object
+      additionalProperties: false
+      required: [client_id, token]
+      properties:
+        client_id:
+          type: string
+          minLength: 1
+          description: Строковое имя сотрудника, например tonny. Не числовой ID.
+          example: tonny
+        token:
+          type: string
+          minLength: 1
+          maxLength: 512
+          writeOnly: true
+          description: Исходный персональный токен; сервер допускает не более 512 байт.
+    HelloResponse:
+      type: object
+      additionalProperties: false
+      required: [client, session_token, expires_at]
+      properties:
+        client:
+          $ref: '#/components/schemas/Client'
+        session_token:
+          type: string
+          minLength: 1
+          description: Случайный токен созданной сессии для Authorization Bearer в рабочих запросах.
+          example: <токен сессии из ответа рукопожатия>
+        expires_at:
+          type: string
+          format: date-time
+          description: Момент истечения сессии; по умолчанию через 24 часа после рукопожатия.
+          example: '2026-10-19T12:00:00Z'
+    CreateClientRequest:
+      type: object
+      additionalProperties: false
+      required: [name, kind, role]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          pattern: '[^\s]'
+          description: Уникальное непустое имя. NUL запрещён; пробелы автоматически не обрезаются.
+          example: tonny
+        kind:
+          type: string
+          enum: [staff, freelance]
+        role:
+          type: string
+          enum: [reporter, editor]
+        trust:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          default: 0
+          description: HTTP API использует 0 при отсутствии поля.
+        enabled:
+          type: boolean
+          nullable: true
+          default: true
+    UpdateClientRequest:
+      type: object
+      additionalProperties: false
+      description: Хотя бы одно из полей должно иметь значение, отличное от null. 0 и false допустимы.
+      properties:
+        trust:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          nullable: true
+        enabled:
+          type: boolean
+          nullable: true
+      anyOf:
+        - required: [trust]
+          properties:
+            trust:
+              type: number
+              format: double
+              minimum: 0
+              maximum: 1
+        - required: [enabled]
+          properties:
+            enabled:
+              type: boolean
+    ClientCredentials:
+      type: object
+      additionalProperties: false
+      required: [client, token]
+      properties:
+        client:
+          $ref: '#/components/schemas/Client'
+        token:
+          type: string
+          description: Новый персональный токен для POST /hello. Сохраните его из ответа создания; для рабочих запросов сначала получите session_token.
+          example: <новый персональный токен>
+    NoteRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id, rubric, topic, event_at]
+      properties:
+        request_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '[^\s]'
+          description: |
+            Идентификатор операции, уникальный для автора. CLI генерирует UUID v4;
+            API допускает и другую непустую строку без NUL. При retry сохраняйте значение.
+          example: ea466278-d76e-45c7-bbb3-11f3658a6ee1
+        rubric:
+          type: string
+          minLength: 1
+          maxLength: 100
+          pattern: '[^\s]'
+          description: Рубрика сюжета. NUL запрещён.
+          example: Город
+        topic:
+          type: string
+          minLength: 1
+          maxLength: 500
+          pattern: '[^\s]'
+          description: Тема сюжета. NUL запрещён.
+          example: Обрушился мост
+        body:
+          type: string
+          maxLength: 20000
+          default: ''
+          description: Необязательный текст заметки. NUL запрещён; действует также общий лимит тела 64 KiB.
+          example: Увидел разрушенный мост
+        event_at:
+          type: string
+          format: date-time
+          description: |
+            Время события в RFC3339, начиная с 1970 года и не более чем на минуту
+            в будущем относительно сервера. Старые события допускаются с затуханием веса.
+            При retry сохраняйте исходный момент времени.
+          example: '2026-10-18T12:00:00Z'
+    Receipt:
+      type: object
+      additionalProperties: false
+      required: [status, note_id, story_id, contributes, published]
+      properties:
+        status:
+          type: string
+          enum: [accepted, duplicate]
+          description: accepted — новая сохранённая операция; duplicate — повтор без вставки.
+        note_id:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 100
+        story_id:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 10
+        contributes:
+          type: boolean
+          description: Даёт ли эта заметка единственный голос автора в сюжете.
+        published:
+          type: boolean
+          description: Опубликован ли сюжет к моменту ответа. Не означает, что именно этот запрос его опубликовал.
+    Story:
+      type: object
+      additionalProperties: false
+      required: [id, rubric, topic, created_at, published_at, trust_at_publish, current_trust]
+      properties:
+        id:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 10
+        rubric:
+          type: string
+          example: Город
+        topic:
+          type: string
+          example: Обрушился мост
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-10-18T12:00:00Z'
+        published_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Время публикации; null до публикации.
+          example: null
+        trust_at_publish:
+          type: number
+          format: double
+          minimum: 0
+          nullable: true
+          description: Зафиксированная сумма при публикации; null до неё.
+          example: null
+        current_trust:
+          type: number
+          format: double
+          minimum: 0
+          description: До публикации — затухающее доверие голосов; после — trust_at_publish.
+          example: 0.25
+        participants:
+          type: array
+          description: Первые голоса авторов. Пустое поле может быть опущено; в списке сюжетов оно необязательно.
+          items:
+            $ref: '#/components/schemas/Participant'
+    Participant:
+      type: object
+      additionalProperties: false
+      required: [client_id, name, first_note_id, received_at, rank]
+      properties:
+        client_id:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Числовой ID автора.
+          example: 2
+        name:
+          type: string
+          example: tonny
+        first_note_id:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 100
+        received_at:
+          type: string
+          format: date-time
+          description: Время приёма первой учтённой заметки сервером.
+          example: '2026-10-18T12:00:00Z'
+        rank:
+          type: integer
+          minimum: 1
+          nullable: true
+          description: Место при публикации; null до публикации.
+          example: null
+    Notification:
+      type: object
+      additionalProperties: false
+      required: [id, client_id, story_id, rank, message, created_at, acknowledged_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Этот ID передаётся в путь подтверждения ack.
+          example: 500
+        client_id:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 2
+        story_id:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 10
+        rank:
+          type: integer
+          minimum: 1
+          example: 1
+        message:
+          type: string
+          example: Поздравляем, ваша заметка попала в печать. Вы были 1-м, кто сказал нам об этой новости.
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-10-18T12:00:00Z'
+        acknowledged_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: GET /notifications возвращает только записи с null.
+          example: null
+    StoryParticipation:
+      type: object
+      additionalProperties: false
+      required: [story_id, rubric, topic, published_at, rank]
+      properties:
+        story_id:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 10
+        rubric:
+          type: string
+          example: Город
+        topic:
+          type: string
+          example: Обрушился мост
+        published_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Время публикации сюжета или null.
+        rank:
+          type: integer
+          minimum: 1
+          nullable: true
+          description: Место сотрудника; null, если его голос не участвовал в публикации.
+    Stats:
+      type: object
+      additionalProperties: false
+      required: [client, notes_accepted, notes_published, publication_share, stories_touched, sensations, average_rank, stories]
+      properties:
+        client:
+          $ref: '#/components/schemas/Client'
+        notes_accepted:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Все сохранённые заметки сотрудника, включая дополнительные и поздние. Retry не учитывается повторно.
+          example: 2
+        notes_published:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Число заметок с назначенным rank. Учитываются все места, независимо от получения поздравления.
+          example: 1
+        publication_share:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: notes_published / notes_accepted; 0 при отсутствии заметок. Значение от 0 до 1, не проценты.
+          example: 0.5
+        stories_touched:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Число разных сюжетов, в которых сотрудник отправлял заметки.
+          example: 1
+        sensations:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Число опубликованных вкладов с rank=1.
+          example: 1
+        average_rank:
+          type: number
+          format: double
+          minimum: 0
+          description: Среднее ненулевых rank; 0 при отсутствии мест публикации.
+          example: 1
+        stories:
+          type: array
+          description: Все затронутые сюжеты по возрастанию ID, включая сообщения после публикации.
+          items:
+            $ref: '#/components/schemas/StoryParticipation'
+    Error:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [invalid, unauthorized, forbidden, not_found, conflict, internal]
+        message:
+          type: string
+          description: Описание ошибки. Внутренние детали БД клиенту не раскрываются.
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/Error'
+  responses:
+    BadRequest:
+      description: Некорректный JSON, неизвестное поле, неверный тип, параметр пути/query или нарушение правил запроса.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: invalid
+              message: limit must be at most 1000
+    Unauthorized:
+      description: Нет Bearer-токена сессии, сессия неизвестна или истекла, credentials рукопожатия неверны либо клиент отключён. Персональный токен в Bearer не принимается.
+      headers:
+        WWW-Authenticate:
+          description: Требуемая схема аутентификации.
+          schema:
+            type: string
+            example: Bearer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: unauthorized
+              message: invalid client credentials
+    Forbidden:
+      description: Токен корректен, но у сотрудника нет роли editor.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: forbidden
+              message: editor role is required
+    NotFound:
+      description: Объект не найден; для ack так же обрабатывается чужое уведомление.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: not_found
+              message: story not found
+    Conflict:
+      description: Имя сотрудника занято или request_id этого автора уже использован с другими полями заметки.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: conflict
+              message: request_id was already used for a different note
+    RequestTooLarge:
+      description: Тело JSON-запроса превышает 65536 байт.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: invalid
+              message: request body is too large
+    InternalError:
+      description: Внутренняя ошибка. Подробности записаны в лог сервера.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: internal
+              message: internal server error

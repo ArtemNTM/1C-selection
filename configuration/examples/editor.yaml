@@ -1,0 +1,8 @@
+# Скопируйте в .times-local/editor.local.yaml. Запускайте из корня проекта.
+server: http://127.0.0.1:8080
+# То же имя, что в clients[0].name в конфиге сервера.
+client_id: editor
+# Клиент прочитает токен, который выдаст и сохранит сервер.
+token_file: .times-local/editor.token
+state_dir: .times-local/editor-state
+request_timeout: 20s

@@ -1,0 +1,7 @@
+/bin/
+/.env
+.CLI_TOKEN
+*.local.yaml
+/.times-*/
+*.test
+coverage.out
